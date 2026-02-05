@@ -1,32 +1,29 @@
-import logging
-import voluptuous as vol
 from typing import Any, Optional, Tuple
 
-from .beurer import BeurerInstance
-from .const import DOMAIN
-
-from homeassistant.const import CONF_MAC
-import homeassistant.helpers.config_validation as cv
-from homeassistant.components.light import (COLOR_MODE_RGB, PLATFORM_SCHEMA,
-                                            LightEntity, ATTR_RGB_COLOR, ATTR_BRIGHTNESS, ATTR_EFFECT, COLOR_MODE_WHITE, ATTR_WHITE, LightEntityFeature)
-from homeassistant.util.color import (match_max_scale)
+from homeassistant.components.light import (
+    ATTR_BRIGHTNESS,
+    ATTR_EFFECT,
+    ATTR_RGB_COLOR,
+    ColorMode,
+    LightEntity,
+    LightEntityFeature,
+)
 from homeassistant.helpers import device_registry
-from .const import LOGGER
+from homeassistant.util.color import match_max_scale
 
-PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend({
-    vol.Required(CONF_MAC): cv.string
-})
+from .beurer import BeurerInstance
+from .const import DOMAIN, LOGGER
 
-async def async_setup_entry(hass, config_entry, async_add_devices):
+async def async_setup_entry(hass, config_entry, async_add_entities):
     LOGGER.debug(f"Setting up device from light")
     instance = hass.data[DOMAIN][config_entry.entry_id]
-    async_add_devices([BeurerLight(instance, config_entry.data["name"], config_entry.entry_id)])
+    async_add_entities([BeurerLight(instance, config_entry.data["name"], config_entry.entry_id)])
 
 class BeurerLight(LightEntity):
     def __init__(self, beurerInstance: BeurerInstance, name: str, entry_id: str) -> None:
         self._instance = beurerInstance
         self._entry_id = entry_id
-        self._attr_supported_color_modes = {COLOR_MODE_RGB, COLOR_MODE_WHITE}
+        self._attr_supported_color_modes = {ColorMode.RGB, ColorMode.WHITE}
         self._color_mode = None
         self._attr_name = name
         self._attr_unique_id = self._instance.mac
@@ -38,12 +35,11 @@ class BeurerLight(LightEntity):
 
     def update_callback(self) -> None:
         """Schedule a state update."""
-        #self.async_schedule_update_ha_state(False)
-        self.schedule_update_ha_state(False)
+        self.async_write_ha_state()
 
     @property
     def available(self):
-        return self._instance.is_on != None
+        return self._instance.is_on is not None
 
     #We handle update triggers manually, do not poll
     @property
@@ -52,7 +48,7 @@ class BeurerLight(LightEntity):
 
     @property
     def brightness(self):
-        if self._instance.color_mode == COLOR_MODE_WHITE:
+        if self._instance.color_mode == ColorMode.WHITE:
             return self._instance.white_brightness
         else:
             return self._instance.color_brightness
@@ -71,7 +67,7 @@ class BeurerLight(LightEntity):
 
     @property
     def effect(self):
-        if self._instance.color_mode == COLOR_MODE_WHITE:
+        if self._instance.color_mode == ColorMode.WHITE:
             return "Off"
         else:
             return self._instance.effect
