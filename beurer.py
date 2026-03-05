@@ -3,7 +3,7 @@ from bleak import BleakClient, BleakScanner, BLEDevice, BleakGATTCharacteristic,
 import traceback
 import asyncio
 
-from homeassistant.components.light import (COLOR_MODE_RGB, COLOR_MODE_WHITE)
+from homeassistant.components.light import ColorMode
 
 from .const import LOGGER
 
@@ -71,7 +71,7 @@ class BeurerInstance:
             track = traceback.format_exc()
             LOGGER.debug(track)
             LOGGER.warn(f"Error while trying to write to device: {error}")
-            self.disconnect()
+            await self.disconnect()
 
     @property
     def mac(self):
@@ -130,7 +130,7 @@ class BeurerInstance:
     async def set_color(self, rgb: Tuple[int, int, int]):
         r, g, b = rgb
         LOGGER.debug(f"Setting to color: %s, %s, %s", r, g, b)
-        self._mode = COLOR_MODE_RGB
+        self._mode = ColorMode.RGB
         self._rgb_color = (r,g,b)
         if not self._color_on:
             await self.turn_on()
@@ -141,7 +141,7 @@ class BeurerInstance:
 
     async def set_color_brightness(self, brightness: int):
         LOGGER.debug(f"Setting to brightness {brightness}")
-        self._mode = COLOR_MODE_RGB
+        self._mode = ColorMode.RGB
         if not self._color_on:
             await self.turn_on()
         #Send brightness
@@ -152,7 +152,7 @@ class BeurerInstance:
     async def set_white(self, intensity: int):
         LOGGER.debug(f"Setting white to intensity: %s", intensity)
         #self._brightness = intensity
-        self._mode = COLOR_MODE_WHITE
+        self._mode = ColorMode.WHITE
         if not self._light_on:
             await self.turn_on()
         await self.sendPacket([0x31,0x01,int(intensity/255*100)])
@@ -162,7 +162,7 @@ class BeurerInstance:
 
     async def set_effect(self, effect: str):
         LOGGER.debug(f"Setting effect {effect}")
-        self._mode = COLOR_MODE_RGB
+        self._mode = ColorMode.RGB
         if not self._color_on:
             await self.turn_on()
         await self.sendPacket([0x34,self.find_effect_position(effect)])
@@ -173,7 +173,7 @@ class BeurerInstance:
         if not self._device.is_connected:
             await self.connect()
         #WHITE mode
-        if self._mode == COLOR_MODE_WHITE:
+        if self._mode == ColorMode.WHITE:
             await self.sendPacket([0x37,0x01])
         #COLOR mode
         else:
@@ -229,14 +229,14 @@ class BeurerInstance:
             self._light_on = True if res[9] == 1 else False
             if res[9] == 1:
                 self._brightness = int(res[10]*255/100) if res[10] > 0 else None
-                self._mode = COLOR_MODE_WHITE
+                self._mode = ColorMode.WHITE
             #self._is_on = self._light_on or self._color_on
             LOGGER.debug(f"Short version, on: {self._is_on}, brightness: {self._brightness}")
         #Long version with color information
         elif reply_version == 2:
                 self._color_on = True if res[9] == 1 else False
                 if res[9] == 1:
-                    self._mode = COLOR_MODE_RGB
+                    self._mode = ColorMode.RGB
                     #effect will be turned off if light off, update only if light on
                     self._effect = self._supported_effects[res[16]]
                 self._color_brightness = int(res[10]*255/100) if res[10] > 0 else None
@@ -291,7 +291,7 @@ class BeurerInstance:
             track = traceback.format_exc()
             LOGGER.debug(track)
             LOGGER.error(f"Error connecting: {error}")
-            self.disconnect()
+            await self.disconnect()
             return False
         await asyncio.sleep(0.1)
         return True
@@ -314,7 +314,7 @@ class BeurerInstance:
             track = traceback.format_exc()
             LOGGER.debug(track)
             LOGGER.error(f"Error getting status: {error}")
-            self.disconnect()
+            await self.disconnect()
 
     async def disconnect(self):
         LOGGER.debug("Disconnecting")
