@@ -7,8 +7,8 @@ from .const import DOMAIN
 
 from homeassistant.const import CONF_MAC
 import homeassistant.helpers.config_validation as cv
-from homeassistant.components.light import (COLOR_MODE_RGB, PLATFORM_SCHEMA,
-                                            LightEntity, ATTR_RGB_COLOR, ATTR_BRIGHTNESS, ATTR_EFFECT, COLOR_MODE_WHITE, ATTR_WHITE, LightEntityFeature)
+from homeassistant.components.light import (ColorMode, PLATFORM_SCHEMA,
+                                            LightEntity, ATTR_RGB_COLOR, ATTR_BRIGHTNESS, ATTR_EFFECT, ATTR_WHITE, LightEntityFeature)
 from homeassistant.util.color import (match_max_scale)
 from homeassistant.helpers import device_registry
 from .const import LOGGER
@@ -26,7 +26,7 @@ class BeurerLight(LightEntity):
     def __init__(self, beurerInstance: BeurerInstance, name: str, entry_id: str) -> None:
         self._instance = beurerInstance
         self._entry_id = entry_id
-        self._attr_supported_color_modes = {COLOR_MODE_RGB, COLOR_MODE_WHITE}
+        self._attr_supported_color_modes = {ColorMode.RGB, ColorMode.WHITE}
         self._color_mode = None
         self._attr_name = name
         self._attr_unique_id = self._instance.mac
@@ -52,7 +52,7 @@ class BeurerLight(LightEntity):
 
     @property
     def brightness(self):
-        if self._instance.color_mode == COLOR_MODE_WHITE:
+        if self._instance.color_mode == ColorMode.WHITE:
             return self._instance.white_brightness
         else:
             return self._instance.color_brightness
@@ -71,7 +71,7 @@ class BeurerLight(LightEntity):
 
     @property
     def effect(self):
-        if self._instance.color_mode == COLOR_MODE_WHITE:
+        if self._instance.color_mode == ColorMode.WHITE:
             return "Off"
         else:
             return self._instance.effect
