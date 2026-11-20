@@ -13,5 +13,5 @@ jobs:
     steps:
       - uses: "actions/checkout@v5"
         with:
-          path: beurer
+          path: custom_components/beurer
       - uses: home-assistant/actions/hassfest@master
