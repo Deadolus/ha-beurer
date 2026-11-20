@@ -1,5 +1,6 @@
 {
     "name": "Beurer",
     "content_in_root": true,
+    "homeassistant": "2026.11.0",
     "render_readme": true
   }

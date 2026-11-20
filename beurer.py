@@ -1,326 +1,424 @@
-from typing import Tuple, Callable
-from bleak import BleakClient, BleakScanner, BLEDevice, BleakGATTCharacteristic, BleakError
-import traceback
-import asyncio
+"""Home Assistant Bluetooth transport for the Beurer TL100."""
 
-from homeassistant.components.light import (COLOR_MODE_RGB, COLOR_MODE_WHITE)
+from __future__ import annotations
+
+import asyncio
+from collections.abc import AsyncIterator, Callable
+from contextlib import asynccontextmanager
+
+from bleak.backends.characteristic import BleakGATTCharacteristic
+from bleak.backends.device import BLEDevice
+from bleak.exc import BleakError
+from bleak_retry_connector import BleakClientWithServiceCache, establish_connection
+
+from homeassistant.components import bluetooth
+from homeassistant.components.light import ColorMode
+from homeassistant.core import HomeAssistant
 
 from .const import LOGGER
 
 WRITE_CHARACTERISTIC_UUIDS = ["8b00ace7-eb0b-49b0-bbe9-9aee0a26e1a3"]
-READ_CHARACTERISTIC_UUIDS  = ["0734594a-a8e7-4b1a-a6b1-cd5243059a57"]
+READ_CHARACTERISTIC_UUIDS = ["0734594a-a8e7-4b1a-a6b1-cd5243059a57"]
+STATUS_TIMEOUT = 10.0
 
-async def discover():
-    """Discover Bluetooth LE devices."""
-    devices = await BleakScanner.discover()
-    LOGGER.debug("Discovered devices: %s", [{"address": device.address, "name": device.name} for device in devices])
-    return [device for device in devices if device.name and device.name.lower().startswith("tl100")]
-
-def create_status_callback(future: asyncio.Future):
-    def callback(sender: int, data: bytearray):
-        if not future.done():
-            future.set_result(data)
-    return callback
-
-async def get_device(mac: str) -> BLEDevice:
-    devices = await BleakScanner.discover()
-    LOGGER.debug(f"Discovered devices: {devices}")
-    return next((device for device in devices if device.address.lower()==mac.lower()),None)
 
 class BeurerInstance:
-    def __init__(self, device: BLEDevice) -> None:
-        self._mac = device.address
-        #device = get_device(self._mac)
-        if device == None:
-            LOGGER.error(f"Was not able to find device with mac {self._mac}")
-        self._device = BleakClient(device,  disconnected_callback=self.disconnected_callback)
-        self._trigger_update = None
-        self._is_on = False
-        self._light_on = None
-        self._color_on = None
-        self._rgb_color = (0,0,0)
-        self._brightness = None
-        self._color_brightness = None
-        self._effect = None
-        self._write_uuid = None
-        self._read_uuid = None
-        self._mode = None
-        self._supported_effects = ["Off", "Random", "Rainbow", "Rainbow Slow", "Fusion", "Pulse", "Wave", "Chill", "Action", "Forest", "Summer"]
-        asyncio.create_task(self.connect())
+    """Keep one subscribed connection and serialize complete TL100 operations."""
 
-    def disconnected_callback(self, client):
-        LOGGER.debug("Disconnected callback called!")
-        self._is_on = False
+    def __init__(self, hass: HomeAssistant, mac: str) -> None:
+        self._hass = hass
+        self._mac = mac.upper() if ":" in mac else mac
+        self._lock = asyncio.Lock()
+        self._client: BleakClientWithServiceCache | None = None
+        self._write_characteristic: BleakGATTCharacteristic | None = None
+        self._read_characteristic: BleakGATTCharacteristic | None = None
+        self._notifying = False
+        self._shutdown_requested = False
+        self._known_status: set[int] = set()
+        self._status_event: asyncio.Event | None = None
+        self._pending_status: set[int] | None = None
+        self._status_error: BleakError | None = None
+        self._trigger_update: Callable[[], None] | None = None
         self._light_on = False
         self._color_on = False
-        self._write_uuid = None
-        self._read_uuid = None
-        asyncio.create_task(self.trigger_entity_update())
-
-    def set_update_callback(self, trigger_update: Callable):
-        LOGGER.debug(f"Setting update callback to {trigger_update}")
-        self._trigger_update = trigger_update
-
-    async def _write(self, data: bytearray):
-        LOGGER.debug("Sending in write: " + ''.join(format(x, ' 03x') for x in data)+f" to characteristic {self._write_uuid}, device is {self._device.is_connected}")
-        try:
-            if (not self._device.is_connected) or (self._write_uuid == None):
-                await self._device.connect(timeout=20)
-            await self._device.write_gatt_char(self._write_uuid, data)
-        except (BleakError) as error:
-            track = traceback.format_exc()
-            LOGGER.debug(track)
-            LOGGER.warn(f"Error while trying to write to device: {error}")
-            self.disconnect()
+        self._rgb_color = (0, 0, 0)
+        self._white_brightness = 255
+        self._color_brightness = 255
+        self._effect = "Off"
+        self._mode = ColorMode.RGB
+        self._supported_effects = [
+            "Off", "Random", "Rainbow", "Rainbow Slow", "Fusion", "Pulse",
+            "Wave", "Chill", "Action", "Forest", "Summer",
+        ]
 
     @property
-    def mac(self):
+    def mac(self) -> str:
         return self._mac
 
     @property
-    def is_on(self):
-        return self._is_on
+    def available(self) -> bool:
+        return bool(
+            self._client is not None
+            and self._client.is_connected
+            and not self._shutdown_requested
+            and self._known_status == {1, 2}
+        )
 
     @property
-    def rgb_color(self):
+    def is_on(self) -> bool:
+        return self._light_on or self._color_on
+
+    @property
+    def rgb_color(self) -> tuple[int, int, int]:
         return self._rgb_color
 
     @property
-    def color_brightness(self):
+    def color_brightness(self) -> int:
         return self._color_brightness
 
     @property
-    def white_brightness(self):
-        return self._brightness
+    def white_brightness(self) -> int:
+        return self._white_brightness
 
     @property
-    def effect(self):
+    def effect(self) -> str:
         return self._effect
 
     @property
-    def color_mode(self):
+    def color_mode(self) -> ColorMode:
         return self._mode
 
     @property
-    def supported_effects(self):
+    def supported_effects(self) -> list[str]:
         return self._supported_effects
 
-    def find_effect_position(self, effect) -> int:
-        try:
-            return self._supported_effects.index(effect)
-        except ValueError:
-            #return Off if not found
-            return 0
+    def set_update_callback(self, callback: Callable[[], None] | None) -> None:
+        """Set the synchronous, event-loop-only status listener."""
+        self._trigger_update = callback
 
-    def makeChecksum(self, b: int, bArr: list[int]) -> int:
-        for b2 in bArr:
-            b = b ^ b2
-        return b
-
-    async def sendPacket(self, message: list[int]):
-          #LOGGER.debug(f"Sending packet with length {message.length}: {message}")
-        if not self._device.is_connected:
-            await self.connect()
-        length=len(message)
-        checksum = self.makeChecksum(length+2,message) #Plus two bytes
-        packet=[0xFE,0xEF,0x0A,length+7,0xAB,0xAA,length+2]+message+[checksum,0x55,0x0D,0x0A]
-        print("Sending message"+''.join(format(x, ' 03x') for x in packet))
-        await self._write(packet)
-
-    async def set_color(self, rgb: Tuple[int, int, int]):
-        r, g, b = rgb
-        LOGGER.debug(f"Setting to color: %s, %s, %s", r, g, b)
-        self._mode = COLOR_MODE_RGB
-        self._rgb_color = (r,g,b)
-        if not self._color_on:
-            await self.turn_on()
-        #Send color
-        await self.sendPacket([0x32,r,g,b])
-        await asyncio.sleep(0.1)
-        await self.triggerStatus()
-
-    async def set_color_brightness(self, brightness: int):
-        LOGGER.debug(f"Setting to brightness {brightness}")
-        self._mode = COLOR_MODE_RGB
-        if not self._color_on:
-            await self.turn_on()
-        #Send brightness
-        await self.sendPacket([0x31,0x02,int(brightness/255*100)])
-        await asyncio.sleep(0.1)
-        await self.triggerStatus()
-
-    async def set_white(self, intensity: int):
-        LOGGER.debug(f"Setting white to intensity: %s", intensity)
-        #self._brightness = intensity
-        self._mode = COLOR_MODE_WHITE
-        if not self._light_on:
-            await self.turn_on()
-        await self.sendPacket([0x31,0x01,int(intensity/255*100)])
-        await asyncio.sleep(0.2)
-        self.set_effect("Off")
-        await self.triggerStatus()
-
-    async def set_effect(self, effect: str):
-        LOGGER.debug(f"Setting effect {effect}")
-        self._mode = COLOR_MODE_RGB
-        if not self._color_on:
-            await self.turn_on()
-        await self.sendPacket([0x34,self.find_effect_position(effect)])
-        await self.triggerStatus()
-
-    async def turn_on(self):
-        LOGGER.debug("Turning on")
-        if not self._device.is_connected:
-            await self.connect()
-        #WHITE mode
-        if self._mode == COLOR_MODE_WHITE:
-            await self.sendPacket([0x37,0x01])
-        #COLOR mode
-        else:
-            await self.sendPacket([0x37,0x02])
-            LOGGER.debug(f"Current color state: {self._color_on}, {self._rgb_color}, {self._color_brightness}, {self._effect}")
-            #Lamp wants to turn on on rainbow mode when enabling mood light, so send last status
-            if not self._color_on:
-                LOGGER.debug(f"Restoring last known color state")
-                self._color_on = True
-                await asyncio.sleep(0.2)
-                await self.set_effect(self._effect)
-                await asyncio.sleep(0.2)
-                await self.set_color(self._rgb_color)
-                await self.set_color_brightness(self._color_brightness)
-        await asyncio.sleep(0.2)
-        await self.triggerStatus()
-
-    async def turn_off(self):
-        LOGGER.debug("Turning off")
-        #turn off white
-        await self.sendPacket([0x35,0x01])
-        #turn off color
-        await self.sendPacket([0x35,0x02])
-        await asyncio.sleep(0.1)
-        await self.triggerStatus()
-
-    async def triggerStatus(self):
-        #Trigger notification with current values
-        await self.sendPacket([0x30,0x01])
-        await asyncio.sleep(0.2)
-        await self.sendPacket([0x30,0x02])
-        LOGGER.info(f"Triggered update")
-
-    async def trigger_entity_update(self):
-        if self._trigger_update:
-            LOGGER.debug(f"Triggering async update")
+    def _notify_update(self) -> None:
+        if self._trigger_update is not None:
             self._trigger_update()
-        else:
-            LOGGER.warn(f"No async update function provided: {self._trigger_update}")
 
-    #We receive status version 1 then version 2.
-    # So changes to the light status shall only be done in version 2 handler
-    async def notification_handler(self, characteristic: BleakGATTCharacteristic, res: bytearray):
-        """Simple notification handler which prints the data received."""
-        #LOGGER.info("Received notification %s: %r", characteristic.description, res)
-        LOGGER.debug("Received notification: " + ''.join(format(x, ' 03x') for x in res))
-        if len(res) < 9:
-            return
-        reply_version = res[8]
-        LOGGER.debug(f"Reply version is {reply_version}")
-        #Short version with only _brightness
-        if reply_version == 1:
-            self._light_on = True if res[9] == 1 else False
-            if res[9] == 1:
-                self._brightness = int(res[10]*255/100) if res[10] > 0 else None
-                self._mode = COLOR_MODE_WHITE
-            #self._is_on = self._light_on or self._color_on
-            LOGGER.debug(f"Short version, on: {self._is_on}, brightness: {self._brightness}")
-        #Long version with color information
-        elif reply_version == 2:
-                self._color_on = True if res[9] == 1 else False
-                if res[9] == 1:
-                    self._mode = COLOR_MODE_RGB
-                    #effect will be turned off if light off, update only if light on
-                    self._effect = self._supported_effects[res[16]]
-                self._color_brightness = int(res[10]*255/100) if res[10] > 0 else None
-                self._rgb_color = (res[13], res[14], res[15])
-                self._is_on = self._light_on or self._color_on
-                LOGGER.debug(f"Long version, on: {self._is_on}, brightness: {self._color_brightness}, rgb color: {self._rgb_color}, effect: {self._effect}")
-                LOGGER.debug(f"res: {res[9]}, light_on {self._light_on}, color_on {self._color_on}")
-                await self.trigger_entity_update()
-        #Device turned off
-        elif reply_version == 255:
-                self._is_on = False
-                self._light_on = False
-                self._color_on = False
-                LOGGER.debug(f"Device off")
-                await self.trigger_entity_update()
-        #Device is going to shutdown
-        elif reply_version == 0:
-            LOGGER.debug(f"Device is going to shut down")
-            await self.disconnect()
-            return
-        else:
-            LOGGER.debug(f"Received unknown notification")
+    @asynccontextmanager
+    async def _operation(self) -> AsyncIterator[None]:
+        async with self._lock:
+            try:
+                yield
+            except BaseException:
+                # Preserve the original failure, including cancellation, after
+                # awaiting cleanup rather than leaving a stale client behind.
+                try:
+                    await self._disconnect_locked()
+                except Exception:
+                    LOGGER.exception("Error cleaning up TL100 %s", self._mac)
+                raise
+
+    def _resolve_device(self) -> BLEDevice:
+        device = bluetooth.async_ble_device_from_address(
+            self._hass, self._mac, connectable=True
+        )
+        if device is None:
+            raise BleakError(f"No connectable Bluetooth device found for {self._mac}")
+        return device
+
+    async def connect(self) -> None:
+        """Establish the connection and its single notification subscription."""
+        async with self._operation():
+            await self._connect_locked()
+
+    async def _connect_locked(self) -> None:
+        if (
+            self._client is not None
+            and self._client.is_connected
+            and self._notifying
+            and not self._shutdown_requested
+        ):
             return
 
-    async def connect(self) -> bool:
-        LOGGER.debug(f"Going to connect to device")
-        try:
-            if not self._device.is_connected:
-                await self._device.connect(timeout=20)
-                await asyncio.sleep(0.1)
-
-                for char in self._device.services.characteristics.values():
-                    if char.uuid in WRITE_CHARACTERISTIC_UUIDS:
-                        self._write_uuid = char.uuid
-                    if char.uuid in READ_CHARACTERISTIC_UUIDS:
-                        self._read_uuid = char.uuid
-
-                if not self._read_uuid or not self._write_uuid:
-                    LOGGER.error("No supported read/write UUIDs found")
-                    return False
-
-                LOGGER.info(f"Read UUID: {self._read_uuid}, Write UUID: {self._write_uuid}")
-
-            await asyncio.sleep(0.1)
-            LOGGER.info(f"Starting notifications")
-
-            await self._device.start_notify(self._read_uuid, self.notification_handler)
-
-            await self.triggerStatus()
-            await asyncio.sleep(0.1)
-        except (Exception) as error:
-            track = traceback.format_exc()
-            LOGGER.debug(track)
-            LOGGER.error(f"Error connecting: {error}")
-            self.disconnect()
-            return False
+        await self._disconnect_locked()
+        self._shutdown_requested = False
+        self._client = await establish_connection(
+            BleakClientWithServiceCache,
+            self._resolve_device(),
+            self._mac,
+            disconnected_callback=self._disconnected_callback,
+            ble_device_callback=self._resolve_device,
+            timeout=20.0,
+        )
         await asyncio.sleep(0.1)
-        return True
+        self._check_connected()
+        for uuid in WRITE_CHARACTERISTIC_UUIDS:
+            if characteristic := self._client.services.get_characteristic(uuid):
+                self._write_characteristic = characteristic
+                break
+        for uuid in READ_CHARACTERISTIC_UUIDS:
+            if characteristic := self._client.services.get_characteristic(uuid):
+                self._read_characteristic = characteristic
+                break
+        if self._write_characteristic is None or self._read_characteristic is None:
+            raise BleakError(f"TL100 {self._mac} is missing a required characteristic")
 
-    async def update(self):
+        client = self._client
+        await client.start_notify(
+            self._read_characteristic,
+            lambda characteristic, data: self._dispatch_on_loop(
+                self._handle_notification, client, data
+            ),
+        )
+        self._check_connected()
+        self._notifying = True
+        await asyncio.sleep(0.1)
+        self._check_connected()
+
+    def _check_connected(self) -> None:
+        if (
+            self._client is None
+            or not self._client.is_connected
+            or self._shutdown_requested
+        ):
+            raise BleakError(f"TL100 {self._mac} is disconnected")
+
+    async def _send_packet_locked(
+        self, message: list[int], *, delay: float = 0.1
+    ) -> None:
+        self._check_connected()
+        if self._write_characteristic is None:
+            raise BleakError(f"TL100 {self._mac} has no write characteristic")
+        length = len(message)
+        checksum = length + 2
+        for value in message:
+            checksum ^= value
+        packet = bytes(
+            [0xFE, 0xEF, 0x0A, length + 7, 0xAB, 0xAA, length + 2]
+            + message
+            + [checksum, 0x55, 0x0D, 0x0A]
+        )
+        LOGGER.debug("Sending TL100 %s: %s", self._mac, packet.hex(" "))
+        # The lamp worked with write-without-response, bleak's old default.
+        await self._client.write_gatt_char(
+            self._write_characteristic,
+            packet,
+            response="write-without-response" not in self._write_characteristic.properties,
+        )
+        await asyncio.sleep(delay)
+
+    async def update(self) -> None:
+        """Refresh both channels, failing if either complete reply is missing."""
+        async with self._operation():
+            await self._connect_locked()
+            await self._request_status_locked()
+
+    async def _request_status_locked(self) -> None:
+        self._status_event = asyncio.Event()
+        self._pending_status = {1, 2}
+        self._status_error = None
         try:
-            if not self._device.is_connected:
-                if not await self.connect():
-                    LOGGER.info("Was not able to connect to device for updates")
-                    await self.disconnect()
-                    return
-            await self._device.start_notify(self._read_uuid, self.notification_handler)
+            async with asyncio.timeout(STATUS_TIMEOUT):
+                await self._send_packet_locked([0x30, 0x01], delay=0.2)
+                await self._send_packet_locked([0x30, 0x02])
+                await self._status_event.wait()
+                if self._status_error is not None:
+                    raise self._status_error
+                self._check_connected()
+        except TimeoutError as err:
+            missing = sorted(self._pending_status or ())
+            raise TimeoutError(
+                f"TL100 {self._mac} did not answer status request(s) {missing} "
+                f"within {STATUS_TIMEOUT:g} s"
+            ) from err
+        finally:
+            self._status_event = None
+            self._pending_status = None
+            self._status_error = None
 
-            LOGGER.info(f"Triggering update")
+    async def _prepare_locked(self) -> None:
+        await self._connect_locked()
+        if not self.available:
+            await self._request_status_locked()
 
-            await self.triggerStatus()
-            #await asyncio.sleep(0.1)
+    @staticmethod
+    def _device_brightness(brightness: int) -> int:
+        # Keep the lowest Home Assistant brightness values from becoming 0%.
+        return max(1, int(brightness * 100 / 255))
 
-        except (Exception) as error:
-            track = traceback.format_exc()
-            LOGGER.debug(track)
-            LOGGER.error(f"Error getting status: {error}")
-            self.disconnect()
+    async def _activate_channel_locked(self, mode: ColorMode) -> None:
+        """Switch channels without calling another locked public operation."""
+        if mode == ColorMode.WHITE:
+            if self._color_on:
+                await self._send_packet_locked([0x35, 0x02])
+            if not self._light_on:
+                await self._send_packet_locked([0x37, 0x01], delay=0.2)
+        else:
+            rgb_color = self._rgb_color
+            brightness = self._color_brightness
+            effect = self._effect
+            if self._light_on:
+                await self._send_packet_locked([0x35, 0x01])
+            if not self._color_on:
+                await self._send_packet_locked([0x37, 0x02], delay=0.2)
+                # Enabling mood light defaults to Rainbow. Restore static
+                # color and brightness first, then the remembered animation.
+                await self._send_packet_locked([0x32, *rgb_color])
+                await self._send_packet_locked(
+                    [0x31, 0x02, round(brightness * 100 / 255)],
+                    delay=0.2,
+                )
+                await self._send_packet_locked(
+                    [0x34, self._supported_effects.index(effect)], delay=0.2
+                )
+        self._mode = mode
 
-    async def disconnect(self):
-        LOGGER.debug("Disconnecting")
-        if self._device.is_connected:
-            await self._device.disconnect()
-        self._is_on = False
-        self._light_on = False
-        self._color_on = False
-        await self.trigger_entity_update()
+    async def turn_on(self) -> None:
+        async with self._operation():
+            await self._prepare_locked()
+            await self._activate_channel_locked(self._mode)
+            await self._request_status_locked()
+
+    async def turn_off(self) -> None:
+        async with self._operation():
+            await self._prepare_locked()
+            await self._send_packet_locked([0x35, 0x01])
+            await self._send_packet_locked([0x35, 0x02])
+            await self._request_status_locked()
+
+    async def set_color(self, rgb: tuple[int, int, int]) -> None:
+        async with self._operation():
+            await self._prepare_locked()
+            await self._activate_channel_locked(ColorMode.RGB)
+            await self._send_packet_locked([0x32, *rgb])
+            await self._request_status_locked()
+
+    async def set_color_brightness(self, brightness: int) -> None:
+        async with self._operation():
+            await self._prepare_locked()
+            await self._activate_channel_locked(ColorMode.RGB)
+            await self._send_packet_locked(
+                [0x31, 0x02, self._device_brightness(brightness)]
+            )
+            await self._request_status_locked()
+
+    async def set_white(self, intensity: int) -> None:
+        async with self._operation():
+            await self._prepare_locked()
+            await self._activate_channel_locked(ColorMode.WHITE)
+            await self._send_packet_locked(
+                [0x31, 0x01, self._device_brightness(intensity)], delay=0.2
+            )
+            await self._request_status_locked()
+
+    async def set_effect(self, effect: str) -> None:
+        # list.index deliberately raises ValueError for an unknown effect.
+        position = self._supported_effects.index(effect)
+        async with self._operation():
+            await self._prepare_locked()
+            await self._activate_channel_locked(ColorMode.RGB)
+            await self._send_packet_locked([0x34, position])
+            await self._request_status_locked()
+
+    def _dispatch_on_loop(self, callback: Callable, *args) -> None:
+        try:
+            on_loop = asyncio.get_running_loop() is self._hass.loop
+        except RuntimeError:
+            on_loop = False
+        if on_loop:
+            callback(*args)
+        else:
+            self._hass.loop.call_soon_threadsafe(callback, *args)
+
+    def _disconnected_callback(self, client: BleakClientWithServiceCache) -> None:
+        self._dispatch_on_loop(self._handle_disconnect, client)
+
+    def _invalidate_status(self, reason: str) -> None:
+        self._known_status.clear()
+        self._status_error = BleakError(reason)
+        if self._status_event is not None:
+            self._status_event.set()
+
+    def _handle_disconnect(self, client: BleakClientWithServiceCache) -> None:
+        if client is not self._client:
+            return
+        self._notifying = False
+        self._invalidate_status(f"TL100 {self._mac} disconnected during status refresh")
+        # Keep last power/mode/brightness values: unavailability is not off.
+        self._notify_update()
+
+    def _handle_notification(
+        self, client: BleakClientWithServiceCache, data: bytearray
+    ) -> None:
+        if client is not self._client or self._shutdown_requested or not client.is_connected:
+            return
+        LOGGER.debug("Received TL100 %s: %s", self._mac, data.hex(" "))
+        if len(data) < 9:
+            return
+        version = data[8]
+        if version == 1:
+            if len(data) < 11:
+                return
+            self._light_on = data[9] == 1
+            self._white_brightness = min(255, int(data[10] * 255 / 100))
+        elif version == 2:
+            # Old firmware handling read the effect only while mood light was on.
+            if len(data) < 16:
+                return
+            self._color_on = data[9] == 1
+            self._color_brightness = min(255, int(data[10] * 255 / 100))
+            self._rgb_color = (data[13], data[14], data[15])
+            if self._color_on and len(data) > 16 and data[16] < len(self._supported_effects):
+                self._effect = self._supported_effects[data[16]]
+        elif version == 255:
+            # The lamp answers status requests with this when both channels are off.
+            self._light_on = False
+            self._color_on = False
+            self._known_status.update((1, 2))
+            if self._pending_status is not None:
+                self._pending_status.clear()
+                self._status_event.set()
+            self._notify_update()
+            return
+        elif version == 0:
+            # Do not spawn an unowned task from a notification. An in-flight
+            # operation wakes and awaits disconnect; an idle session is marked
+            # unusable and cleaned up by disconnect or the next operation.
+            self._shutdown_requested = True
+            self._invalidate_status(f"TL100 {self._mac} is shutting down")
+            self._notify_update()
+            return
+        else:
+            return
+
+        if self._color_on:
+            self._mode = ColorMode.RGB
+        elif self._light_on:
+            self._mode = ColorMode.WHITE
+        self._known_status.add(version)
+        if self._pending_status is not None:
+            self._pending_status.discard(version)
+            if not self._pending_status:
+                self._status_event.set()
+        self._notify_update()
+
+    async def disconnect(self) -> None:
+        """Unsubscribe and await disconnect, retaining the last reported state."""
+        async with self._lock:
+            await self._disconnect_locked()
+
+    async def _disconnect_locked(self) -> None:
+        client = self._client
+        read_characteristic = self._read_characteristic
+        self._client = None
+        self._write_characteristic = None
+        self._read_characteristic = None
+        self._notifying = False
+        self._invalidate_status(f"TL100 {self._mac} disconnected")
+        try:
+            if client is not None:
+                try:
+                    # Also attempt this after a partially failed start_notify.
+                    if client.is_connected and read_characteristic is not None:
+                        await client.stop_notify(read_characteristic)
+                finally:
+                    await client.disconnect()
+        finally:
+            if client is not None:
+                self._notify_update()

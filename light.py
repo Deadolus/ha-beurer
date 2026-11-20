@@ -1,128 +1,115 @@
-import logging
-import voluptuous as vol
-from typing import Any, Optional, Tuple
+"""Light entity for the Beurer TL100."""
 
-from .beurer import BeurerInstance
+from typing import Any
+
+from bleak import BleakError
+
+from homeassistant.components.light import (
+    ATTR_BRIGHTNESS,
+    ATTR_EFFECT,
+    ATTR_RGB_COLOR,
+    ATTR_WHITE,
+    ColorMode,
+    LightEntity,
+    LightEntityFeature,
+)
+from homeassistant.const import CONF_NAME
+from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import HomeAssistantError
+from homeassistant.helpers.device_registry import CONNECTION_BLUETOOTH, DeviceInfo
+from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
+from homeassistant.helpers.update_coordinator import CoordinatorEntity
+from homeassistant.util.color import match_max_scale
+
+from . import BeurerConfigEntry, BeurerCoordinator
 from .const import DOMAIN
 
-from homeassistant.const import CONF_MAC
-import homeassistant.helpers.config_validation as cv
-from homeassistant.components.light import (COLOR_MODE_RGB, PLATFORM_SCHEMA,
-                                            LightEntity, ATTR_RGB_COLOR, ATTR_BRIGHTNESS, ATTR_EFFECT, COLOR_MODE_WHITE, ATTR_WHITE, LightEntityFeature)
-from homeassistant.util.color import (match_max_scale)
-from homeassistant.helpers import device_registry
-from .const import LOGGER
 
-PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend({
-    vol.Required(CONF_MAC): cv.string
-})
+async def async_setup_entry(
+    hass: HomeAssistant,
+    config_entry: BeurerConfigEntry,
+    async_add_entities: AddConfigEntryEntitiesCallback,
+) -> None:
+    """Add a light backed by the entry's shared connection."""
+    async_add_entities([BeurerLight(config_entry.runtime_data, config_entry.data[CONF_NAME])])
 
-async def async_setup_entry(hass, config_entry, async_add_devices):
-    LOGGER.debug(f"Setting up device from light")
-    instance = hass.data[DOMAIN][config_entry.entry_id]
-    async_add_devices([BeurerLight(instance, config_entry.data["name"], config_entry.entry_id)])
 
-class BeurerLight(LightEntity):
-    def __init__(self, beurerInstance: BeurerInstance, name: str, entry_id: str) -> None:
-        self._instance = beurerInstance
-        self._entry_id = entry_id
-        self._attr_supported_color_modes = {COLOR_MODE_RGB, COLOR_MODE_WHITE}
-        self._color_mode = None
+class BeurerLight(CoordinatorEntity[BeurerCoordinator], LightEntity):
+    """Control the daylight and mood-light channels of a TL100."""
+
+    _attr_supported_color_modes = {ColorMode.RGB, ColorMode.WHITE}
+    _attr_supported_features = LightEntityFeature.EFFECT
+
+    def __init__(self, coordinator: BeurerCoordinator, name: str) -> None:
+        super().__init__(coordinator)
+        self._instance = coordinator.instance
         self._attr_name = name
+        # Legacy entities used the Bluetooth device's canonical address.
         self._attr_unique_id = self._instance.mac
-
-    async def async_added_to_hass(self) -> None:
-        """Add update callback after being added to hass."""
-        self._instance.set_update_callback(self.update_callback)
-        await self._instance.update()
-
-    def update_callback(self) -> None:
-        """Schedule a state update."""
-        #self.async_schedule_update_ha_state(False)
-        self.schedule_update_ha_state(False)
+        self._attr_device_info = DeviceInfo(
+            identifiers={(DOMAIN, self._instance.mac)},
+            connections={(CONNECTION_BLUETOOTH, self._instance.mac)},
+            name=name,
+            manufacturer="Beurer",
+            model="TL100",
+        )
 
     @property
-    def available(self):
-        return self._instance.is_on != None
-
-    #We handle update triggers manually, do not poll
-    @property
-    def should_poll(self) -> Optional[bool]:
-        return False
+    def available(self) -> bool:
+        return super().available and self._instance.available
 
     @property
-    def brightness(self):
-        if self._instance.color_mode == COLOR_MODE_WHITE:
+    def brightness(self) -> int | None:
+        if self._instance.color_mode == ColorMode.WHITE:
             return self._instance.white_brightness
-        else:
-            return self._instance.color_brightness
-        return None
+        return self._instance.color_brightness
 
     @property
-    def is_on(self) -> Optional[bool]:
+    def is_on(self) -> bool:
         return self._instance.is_on
 
     @property
-    # RGB color/brightness based on https://github.com/home-assistant/core/issues/51175
-    def rgb_color(self):
-        if self._instance.rgb_color:
-            return match_max_scale((255,), self._instance.rgb_color)
-        return None
+    def rgb_color(self) -> tuple[int, int, int]:
+        return match_max_scale((255,), self._instance.rgb_color)
 
     @property
-    def effect(self):
-        if self._instance.color_mode == COLOR_MODE_WHITE:
+    def effect(self) -> str:
+        if self._instance.color_mode == ColorMode.WHITE:
             return "Off"
-        else:
-            return self._instance.effect
+        return self._instance.effect
 
     @property
-    def effect_list(self):
+    def effect_list(self) -> list[str]:
         return self._instance.supported_effects
 
     @property
-    def supported_features(self):
-        return LightEntityFeature.EFFECT
-
-    @property
-    def color_mode(self):
+    def color_mode(self) -> ColorMode:
         return self._instance.color_mode
 
-    @property
-    def device_info(self):
-        return {
-            "identifiers": {
-                (DOMAIN, self._instance.mac)
-            },
-            "name": self.name,
-            "connections": {(device_registry.CONNECTION_NETWORK_MAC, self._instance.mac)}
-        }
-
-    def _transform_color_brightness(self, color: Tuple[int, int, int], set_brightness: int):
-        rgb = match_max_scale((255,), color)
-        res = tuple(color * set_brightness // 255 for color in rgb)
-        return res
-
     async def async_turn_on(self, **kwargs: Any) -> None:
-        LOGGER.debug(f"Turning light on with args: {kwargs}")
-        #if not self.is_on:
-        #    await self._instance.turn_on()
-        if len(kwargs) == 0:
-            await self._instance.turn_on()
+        """Select white explicitly; otherwise dim the current/color channel."""
+        try:
+            if ATTR_WHITE in kwargs:
+                await self._instance.set_white(kwargs[ATTR_WHITE])
+                return
 
-        if ATTR_BRIGHTNESS in kwargs and kwargs[ATTR_BRIGHTNESS]:
-            await self._instance.set_white(kwargs[ATTR_BRIGHTNESS])
-
-        if ATTR_RGB_COLOR in kwargs and kwargs[ATTR_RGB_COLOR]:
-            color = kwargs[ATTR_RGB_COLOR]
-            await self._instance.set_color(color)
-
-        if ATTR_EFFECT in kwargs and kwargs[ATTR_EFFECT]:
-            await self._instance.set_effect(kwargs[ATTR_EFFECT])
-
+            if ATTR_RGB_COLOR in kwargs:
+                await self._instance.set_color(kwargs[ATTR_RGB_COLOR])
+            if ATTR_EFFECT in kwargs:
+                await self._instance.set_effect(kwargs[ATTR_EFFECT])
+            if ATTR_BRIGHTNESS in kwargs:
+                if self._instance.color_mode == ColorMode.WHITE:
+                    await self._instance.set_white(kwargs[ATTR_BRIGHTNESS])
+                else:
+                    await self._instance.set_color_brightness(kwargs[ATTR_BRIGHTNESS])
+            elif ATTR_RGB_COLOR not in kwargs and ATTR_EFFECT not in kwargs:
+                await self._instance.turn_on()
+        except (BleakError, TimeoutError) as err:
+            raise HomeAssistantError(f"Unable to control the Beurer lamp: {err}") from err
 
     async def async_turn_off(self, **kwargs: Any) -> None:
-        await self._instance.turn_off()
-
-    async def async_update(self) -> None:
-        await self._instance.update()
+        """Switch off both channels."""
+        try:
+            await self._instance.turn_off()
+        except (BleakError, TimeoutError) as err:
+            raise HomeAssistantError(f"Unable to control the Beurer lamp: {err}") from err

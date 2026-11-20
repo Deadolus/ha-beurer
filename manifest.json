@@ -1,12 +1,18 @@
 {
     "domain": "beurer",
     "name": "Beurer",
+    "bluetooth": [
+        {"local_name": "TL100*", "connectable": true},
+        {"local_name": "tl100*", "connectable": true},
+        {"local_name": "Tl100*", "connectable": true}
+    ],
     "codeowners": [],
     "config_flow": true,
-    "dependencies": [],
+    "dependencies": ["bluetooth_adapters"],
     "documentation": "https://github.com/deadolus/ha-beurer",
+    "integration_type": "device",
     "iot_class": "local_polling",
     "issue_tracker": "https://github.com/deadolus/ha-beurer/issues",
-    "requirements": [],
-    "version": "0.0.1"
+    "requirements": ["bleak-retry-connector==4.7.1"],
+    "version": "0.1.0"
 }

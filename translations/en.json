@@ -1,35 +1,56 @@
 {
     "config": {
+        "flow_title": "{name}",
         "step": {
             "user": {
+                "title": "Choose a Beurer light",
+                "description": "Choose a nearby TL100 or enter its Bluetooth MAC address manually. Setup reads the light's status without changing its brightness or color.",
                 "data": {
-                    "mac": "Bluetooth MAC address",
+                    "mac": "Bluetooth device",
                     "name": "Name"
                 },
-                "title": "Pick a Beurer light. Make sure light in sight for validation."
-            },
-            "validate": {
-                "data": {
-                    "retry": "Retry validate connection?",
-                    "flicker": "Did the light blink?"
-                },
-                "title": "Validate Beurer connection"
+                "data_description": {
+                    "name": "Optional. Leave blank to use the device name."
+                }
             },
             "manual": {
+                "title": "Enter a Bluetooth MAC address",
+                "description": "Keep the Beurer TL100 powered and within range of a connectable Bluetooth adapter.",
                 "data": {
                     "mac": "Bluetooth MAC address",
                     "name": "Name"
                 },
-                "title": "Enter bluetooth MAC address"
+                "data_description": {
+                    "mac": "For example, AA:BB:CC:DD:EE:FF.",
+                    "name": "Optional. Leave blank to use the device name or Beurer TL100."
+                }
+            },
+            "bluetooth_confirm": {
+                "title": "Set up {name}",
+                "description": "Set up {name}? Confirmation reads the light's status without changing its brightness or color.",
+                "data": {
+                    "name": "Name"
+                },
+                "data_description": {
+                    "name": "Optional. Leave blank to keep the discovered device name."
+                }
             }
         },
         "error": {
-            "connect": "Unable to connect to Beurer"
+            "cannot_connect": "Unable to connect to the light. Make sure it is powered and within range of a connectable Bluetooth adapter, then try again.",
+            "invalid_mac": "Enter a valid Bluetooth MAC address, such as AA:BB:CC:DD:EE:FF."
         },
         "abort": {
-            "cannot_validate": "Unable to validate Beurer light",
-            "cannot_connect": "Unable to connect to Beurer"
+            "already_configured": "This Beurer light is already configured.",
+            "already_in_progress": "Setup for this Beurer light is already in progress.",
+            "not_supported": "This device is not a connectable Beurer TL100."
         }
     },
-    "title": "Beurer"
+    "selector": {
+        "device": {
+            "options": {
+                "manual": "Enter a MAC address manually"
+            }
+        }
+    }
 }
