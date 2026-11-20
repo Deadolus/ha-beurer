@@ -1,0 +1,10 @@
+homeassistant==2026.11.2
+bleak-retry-connector==4.7.1
+habluetooth==7.1.2
+bluetooth-adapters==2.4.0
+bluetooth-auto-recovery==1.6.4
+aiousbwatcher==1.1.2
+serialx==1.15.1
+aiohasupervisor==0.8.1
+pytest>=8
+pytest-asyncio>=1
